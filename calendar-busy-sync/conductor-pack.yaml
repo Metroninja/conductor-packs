@@ -1,0 +1,341 @@
+# calendar-busy-sync — a distributable conductor pack.
+#
+# Keep several Google calendars honest about when you are busy. Every event on
+# a SOURCE calendar gets a "Busy" block on every other TARGET calendar, so a
+# colleague looking at your work calendar sees the time your personal (or other
+# job's) calendar already holds. Blocks follow the source: moved when it moves,
+# removed when it is cancelled, declined, or marked free.
+#
+# Pure verbs + two small js steps — no agent, no model, no cost.
+#
+# Define-behavior / bind-environment: this pack ships only BEHAVIOR (one
+# workflow, two disarmed triggers). It carries NO connectors and NO secrets —
+# you bind your own `google-calendar` connectors (one per calendar) and a cron
+# schedule in the `packs:` block. See README.md for the Google OAuth setup.
+#
+# Install (in your config's `packs:` block):
+#   connectors:
+#     timer:        { use: cron, schedules: { busy_sync: { every: 15m } } }
+#     cal-personal: { use: google-calendar, auth: { … } }   # + watch: { … } for on_change
+#     cal-work:     { use: google-calendar, auth: { … } }
+#     cal-side:     { use: google-calendar, auth: { … } }
+#   packs:
+#     busy:
+#       source: github.com/NodeSpy/conductor-packs//calendar-busy-sync
+#       version: "=0.1.0"
+#       connectors:
+#         sources: [cal-personal, cal-work, cal-side]   # whose events block time
+#         targets: [cal-work, cal-side]                 # where the blocks are written
+#         cron: timer
+#       triggers:
+#         sweep:     { enabled: true }   # the periodic pass; keep it armed
+#         on_change: { enabled: true }   # optional: push-driven, needs watch: on each source
+#   Then: `conductor init`, `conductor pack plan`, `conductor validate`.
+
+pack:
+  name: calendar-busy-sync
+  version: 0.1.0
+  description: Mirror busy time across Google calendars — every event on a source calendar becomes a private "Busy" block on the other target calendars, kept in step by push + a sweep. Pure verbs, no agent.
+  tags: [calendar, google, scheduling]
+  homepage: https://github.com/NodeSpy/conductor-packs
+  license: Apache-2.0
+  requires:
+    # >=0.106.0: list sockets (`many: true`) and the `over:`/`member:` step
+    # fields that address them. Older daemons reject this manifest at parse.
+    conductor: ">=0.106.0"
+    connectors:
+      # List sockets: you name every calendar the pack may read and write.
+      # A calendar may sit in both lists (two work calendars that block each
+      # other); it never receives a block for its own events.
+      # >=1.2.0: the `changed` push source and paged `events`.
+      sources: { many: true, type: google-calendar, version: ">=1.2.0" }
+      targets: { many: true, type: google-calendar, version: ">=1.2.0" }
+      # The sweep schedule. Your cron connector must declare `busy_sync`.
+      cron: "*"
+
+settings:
+  window_days:
+    type: integer
+    default: 30
+    desc: "How far ahead to mirror. Blocks beyond this appear as the window rolls forward."
+  block_title:
+    type: string
+    default: Busy
+    desc: "Title of a block. Used for every block unless show_details is on."
+  show_details:
+    type: boolean
+    default: false
+    desc: "Copy the source event's title onto the block instead of block_title. Blocks stay private either way."
+  color_id:
+    type: string
+    default: "8"
+    desc: "Google event colour id for blocks (1-11; 8 is graphite). Empty leaves the calendar's own colour."
+  mirror_all_day:
+    type: boolean
+    default: false
+    desc: "Also mirror all-day events that are marked busy. Off by default: most all-day events are reminders."
+  tag:
+    type: string
+    default: conductorBusySync
+    desc: "Private extended-property name that marks a block as this pack's. Change it only to run two independent instances over the same calendar."
+  max_deletes:
+    type: integer
+    default: 50
+    desc: "Refuse a run that would delete more than this many blocks — a guard against a bad read wiping every block."
+  batch_size:
+    type: integer
+    default: 50
+    desc: "Most blocks created, moved or removed per run (each counted separately). The rest follow on the next runs. Keep it under your policy.max_fan_out (100 by default)."
+  dry_run:
+    type: boolean
+    default: false
+    desc: "Plan and log only; create, move and delete nothing."
+
+workflows:
+  # One full reconcile. Stateless: it reads every source and target for the
+  # window, works out which blocks should exist, and makes the targets match.
+  # Running it twice is a no-op, so the push trigger and the sweep share it.
+  reconcile:
+    description: "Make every target calendar's busy blocks match the source calendars' events."
+    steps:
+      # Settings are substituted as text, so they cross into js as strings.
+      - id: cfg
+        set:
+          window_days: "${settings.window_days}"
+          block_title: "${settings.block_title}"
+          show_details: "${settings.show_details}"
+          color_id: "${settings.color_id}"
+          mirror_all_day: "${settings.mirror_all_day}"
+          tag: "${settings.tag}"
+          max_deletes: "${settings.max_deletes}"
+          batch_size: "${settings.batch_size}"
+
+      - id: window
+        use: js
+        code: |
+          const days = parseInt(ctx.cfg.window_days, 10);
+          if (!(days > 0)) throw new Error("window_days must be a positive integer");
+          const now = new Date();
+          if (now.getUTCFullYear() < 2025) throw new Error("js clock looks wrong: " + now.toISOString());
+          return {
+            timeMin: now.toISOString(),
+            timeMax: new Date(now.getTime() + days * 86400000).toISOString(),
+          };
+
+      # Recurring events are expanded (singleEvents) so each occurrence is its
+      # own block. A failed read fails the run here — nothing is deleted on a
+      # partial picture.
+      - id: src
+        uses: sources.events
+        over: true
+        options:
+          timeMin: "{{.window.timeMin}}"
+          timeMax: "{{.window.timeMax}}"
+          singleEvents: true
+          maxResults: 2500
+
+      # The targets are read whole (not just this pack's blocks): the plan also
+      # needs to know when a target already holds the very meeting a source has.
+      - id: dst
+        uses: targets.events
+        over: true
+        options:
+          timeMin: "{{.window.timeMin}}"
+          timeMax: "{{.window.timeMax}}"
+          singleEvents: true
+          maxResults: 2500
+
+      - id: plan
+        use: js
+        code: |
+          const cfg = ctx.cfg;
+          const TAG = cfg.tag;
+          const yes = (v) => String(v) === "true";
+          const showDetails = yes(cfg.show_details);
+          const mirrorAllDay = yes(cfg.mirror_all_day);
+          const maxDeletes = parseInt(cfg.max_deletes, 10);
+          const batch = parseInt(cfg.batch_size, 10);
+          if (!(batch > 0)) throw new Error("batch_size must be a positive integer");
+
+          const members = (o) => (o && o.by_member) || {};
+          const itemsOf = (v) => (Array.isArray(v) ? v : (v && v.items) || []);
+          const srcBy = members(ctx.src);
+          const dstBy = members(ctx.dst);
+
+          const tagOf = (e) =>
+            (e && e.extendedProperties && e.extendedProperties.private && e.extendedProperties.private[TAG]) || "";
+          const live = (e) => e && e.status !== "cancelled" && e.start && e.end;
+          // One instant per event edge, comparable across calendars: a target
+          // hands a dateTime back in its own zone's offset.
+          const edge = (t) => (t.dateTime ? String(Date.parse(t.dateTime)) : "d" + t.date);
+          // The same meeting on two calendars shares an iCalUID; with recurring
+          // events expanded, the start pins the occurrence.
+          const meeting = (e) => (e.iCalUID ? e.iCalUID + "@" + edge(e.start) : "");
+
+          // What blocks time: a real event (never one of our own blocks) that
+          // shows as busy and that you have not declined.
+          const blocks = (e) => {
+            if (!live(e) || tagOf(e)) return false;
+            if (e.transparency === "transparent") return false;
+            if (e.eventType === "workingLocation") return false;
+            if (e.start.date && !mirrorAllDay) return false;
+            const me = (e.attendees || []).find((a) => a.self);
+            if (me && me.responseStatus === "declined") return false;
+            return true;
+          };
+
+          const when = (t) => {
+            if (t.date) return { date: t.date };
+            const out = { dateTime: t.dateTime };
+            if (t.timeZone) out.timeZone = t.timeZone;
+            return out;
+          };
+          const body = (key, e) => {
+            const b = {
+              summary: showDetails && e.summary ? e.summary : cfg.block_title,
+              start: when(e.start),
+              end: when(e.end),
+              transparency: "opaque",
+              visibility: "private",
+              reminders: { useDefault: false, overrides: [] },
+              extendedProperties: { private: { [TAG]: key } },
+            };
+            if (cfg.color_id) b.colorId = cfg.color_id;
+            return b;
+          };
+          const same = (have, want) =>
+            edge(have.start) === edge(want.start) &&
+            edge(have.end) === edge(want.end) &&
+            (have.summary || "") === want.summary &&
+            (have.transparency || "opaque") === "opaque" &&
+            have.visibility === "private" &&
+            (!want.colorId || have.colorId === want.colorId);
+
+          const creates = [], updates = [], deletes = [];
+          const wanted = {};   // "<source> -> <target>": blocks that should exist, for the log line
+          const srcNames = Object.keys(srcBy).sort();
+          const dstNames = Object.keys(dstBy).sort();
+
+          for (const target of dstNames) {
+            const existing = itemsOf(dstBy[target]).filter(live);
+            const held = new Set(existing.filter((e) => !tagOf(e)).map(meeting).filter(Boolean));
+
+            // Which blocks SHOULD be on this target, keyed "<source>/<event id>".
+            const want = new Map();
+            const seen = new Set();
+            for (const source of srcNames) {
+              if (source === target) continue;
+              for (const e of itemsOf(srcBy[source])) {
+                if (!blocks(e)) continue;
+                const m = meeting(e);
+                // The target already has this meeting itself, or another
+                // source already supplied a block for it.
+                if (m && (held.has(m) || seen.has(m))) continue;
+                if (m) seen.add(m);
+                const key = source + "/" + e.id;
+                want.set(key, body(key, e));
+                const pair = source + " -> " + target;
+                wanted[pair] = (wanted[pair] || 0) + 1;
+              }
+            }
+
+            // Which blocks ARE on it. A key seen twice is a duplicate (two runs
+            // raced); the first is kept, the rest go.
+            const kept = new Set();
+            for (const e of existing) {
+              const key = tagOf(e);
+              if (!key) continue;
+              if (!want.has(key) || kept.has(key)) {
+                deletes.push({ target, event_id: e.id });
+                continue;
+              }
+              kept.add(key);
+              const w = want.get(key);
+              if (!same(e, w)) updates.push({ target, event_id: e.id, event: w });
+            }
+            for (const [key, w] of want) {
+              if (!kept.has(key)) creates.push({ target, event: w });
+            }
+          }
+
+          if (deletes.length > maxDeletes) {
+            throw new Error(
+              "refusing to delete " + deletes.length + " blocks (max_deletes is " + maxDeletes +
+              "); check the source calendars read correctly, or raise max_deletes"
+            );
+          }
+          // A run does at most `batch` of each; a for_each over more than
+          // policy.max_fan_out items is refused outright. What is left over is
+          // simply still missing on the next run, which plans it again.
+          const left = Math.max(creates.length - batch, 0) + Math.max(updates.length - batch, 0) +
+            Math.max(deletes.length - batch, 0);
+          return {
+            creates: creates.slice(0, batch),
+            updates: updates.slice(0, batch),
+            deletes: deletes.slice(0, batch),
+            pending: left,
+            summary: creates.length + " to create, " + updates.length + " to move, " + deletes.length +
+              " to remove across " + dstNames.length + " target(s) from " + srcNames.length + " source(s)" +
+              "; blocks wanted: " + (Object.keys(wanted).sort().map((k) => k + " " + wanted[k]).join(", ") || "none") +
+              (left ? "; batch_size " + batch + ", " + left + " left for later runs" : ""),
+          };
+
+      - log: "calendar-busy-sync: {{.plan.summary}}"
+
+      - id: create
+        if: "!${settings.dry_run}"
+        for_each: "{{.plan.creates}}"
+        uses: targets.event_create
+        member: "{{.item.target}}"
+        options:
+          event: "{{.item.event}}"
+
+      - id: move
+        if: "!${settings.dry_run}"
+        for_each: "{{.plan.updates}}"
+        uses: targets.event_update
+        member: "{{.item.target}}"
+        options:
+          event_id: "{{.item.event_id}}"
+          event: "{{.item.event}}"
+
+      - id: remove
+        if: "!${settings.dry_run}"
+        for_each: "{{.plan.deletes}}"
+        uses: targets.event_delete
+        member: "{{.item.target}}"
+        options:
+          event_id: "{{.item.event_id}}"
+
+# conductor counts every run of a trigger against one target as an "attempt",
+# backs off past max_attempts_per_head (3 by default) and PARKS the trigger for
+# good at twice that. That suits a fixer retrying one PR; a calendar or a cron
+# schedule is one target forever, so a sweep would stop after six runs. These
+# triggers are meant to run indefinitely, so the threshold is lifted. One run
+# at a time per trigger keeps two reconciles from racing each other.
+x-policy:
+  always: &always
+    max_attempts_per_head: 1000000000
+    concurrency: { max_runs: 1 }
+
+# Both triggers ship DISARMED. Arming them in the instance block is the consent
+# to write to the calendars you bound as `targets`.
+triggers:
+  # Push-driven: fires seconds after any source calendar changes (the
+  # connector's `changed` source; needs `watch:` on each source connector).
+  - name: on_change
+    "on": sources.changed
+    policy: *always
+    steps:
+      - id: run
+        call: reconcile
+
+  # The backstop. Google push is best-effort and nothing arrives while the
+  # daemon is down, so a periodic pass turns a missed push into latency rather
+  # than a missing block. It also rolls the window forward. KEEP IT ARMED.
+  - name: sweep
+    "on": cron.busy_sync
+    policy: *always
+    steps:
+      - id: run
+        call: reconcile
