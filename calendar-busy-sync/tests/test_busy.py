@@ -37,11 +37,32 @@ def ev(id, start, end=None, **kw):
     return e
 
 
+def reads(p1=(), p2=(), c1=(), c2=()):
+    """The two `over:` read steps' outputs, keyed by connector name — here
+    the connectors are simply called personal_1 … client_2."""
+    return {
+        "read_sources": {"by_member": {"personal_1": {"items": list(p1)}, "personal_2": {"items": list(p2)}}},
+        "read_targets": {"by_member": {"client_1": {"items": list(c1)}, "client_2": {"items": list(c2)}}},
+    }
+
+
+def per_target(out, kinds):
+    """Regroup the flat, target-tagged op lists per target calendar, so the
+    assertions read per calendar (and the target tag is checked to exist)."""
+    for t in ("client_1", "client_2"):
+        out[t] = {k: [] for k in kinds}
+    for k in kinds:
+        for op in out[k]:
+            out[op["target"]][k].append({x: v for x, v in op.items() if x != "target"})
+    return out
+
+
 def plan(p1=(), p2=(), c1=(), c2=(), **cfg):
     c = {"mode": "plan", "dry_run": "false"}
     c.update(cfg)
-    return run({"cfg": c, "read_personal_1": {"items": list(p1)}, "read_personal_2": {"items": list(p2)},
-                "read_client_1": {"items": list(c1)}, "read_client_2": {"items": list(c2)}})
+    ctx = {"cfg": c}
+    ctx.update(reads(p1, p2, c1, c2))
+    return per_target(run(ctx), ("create", "update", "delete"))
 
 
 T = "2026-11-25T10:00:00-07:00"
@@ -168,25 +189,26 @@ class Diff(unittest.TestCase):
         self.assertEqual(out["writes"], 0)
         self.assertEqual(out["client_1"], {"create": [], "update": [], "delete": []})
         self.assertEqual(out["summary"]["client_1"]["create"], 1)
-        self.assertEqual(out["would"]["client_1"]["create"][0]["from"], "personal_1")
+        self.assertEqual(out["would"]["create"][0]["from"], "personal_1")
+        self.assertIn(out["would"]["create"][0]["on"], ("client_1", "client_2"))
 
     def test_dry_run_is_the_default(self):
-        out = run({"cfg": {"mode": "plan"}, "read_personal_1": {"items": []}, "read_personal_2": {"items": []},
-                   "read_client_1": {"items": []}, "read_client_2": {"items": []}})
+        ctx = {"cfg": {"mode": "plan"}}
+        ctx.update(reads())
+        out = run(ctx)
         self.assertTrue(out["dry_run"])
 
     def test_write_cap_defers(self):
         many = [ev("a%d" % i, "2026-11-25T10:%02d:00-07:00" % i, "2026-11-25T11:%02d:00-07:00" % i) for i in range(10)]
-        out = plan(p1=many, max_writes="12")
+        out = plan(p1=many, max_writes="12", max_fan_out="100")
         self.assertEqual(out["writes"], 12)
         self.assertEqual(out["deferred"], 8)
 
     def test_fan_out_cap_per_list(self):
         many = [ev("a%d" % i, "2026-11-25T%02d:%02d:00-07:00" % (i // 60, i % 60), "2026-11-25T23:59:00-07:00") for i in range(7)]
         out = plan(p1=many, max_fan_out="3")
-        self.assertEqual(len(out["client_1"]["create"]), 3)
-        self.assertEqual(len(out["client_2"]["create"]), 3)
-        self.assertEqual(out["deferred"], 8)
+        self.assertEqual(len(out["create"]), 3)  # one for_each step for every target
+        self.assertEqual(out["deferred"], 11)
 
     def test_mass_delete_refused(self):
         first = plan(p1=[ev("a%d" % i, "2026-11-25T10:%02d:00-07:00" % i, "2026-11-25T11:%02d:00-07:00" % i) for i in range(4)])
@@ -195,15 +217,43 @@ class Diff(unittest.TestCase):
             plan(c1=have, max_deletes="3")
 
     def test_missing_read_fails(self):
-        with self.assertRaisesRegex(RuntimeError, "read_client_2 returned no items"):
-            run({"cfg": {"mode": "plan"}, "read_personal_1": {"items": []}, "read_personal_2": {"items": []},
-                 "read_client_1": {"items": []}})
+        with self.assertRaisesRegex(RuntimeError, "read_targets returned no calendars"):
+            run({"cfg": {"mode": "plan"}, "read_sources": reads()["read_sources"]})
+        bad = reads()
+        bad["read_targets"]["by_member"]["client_2"] = {}
+        with self.assertRaisesRegex(RuntimeError, "client_2 returned no items"):
+            run(dict(bad, cfg={"mode": "plan"}))
+
+    def test_any_number_of_calendars(self):
+        # three targets, one source: each target gets the source and the two others
+        ctx = {"cfg": {"mode": "plan", "dry_run": "false"},
+               "read_sources": {"by_member": {"home": {"items": [ev("h", T)]}}},
+               "read_targets": {"by_member": {
+                   "w1": {"items": [ev("a", "2026-11-26T10:00:00Z", "2026-11-26T11:00:00Z")]},
+                   "w2": {"items": []}, "w3": {"items": []}}}}
+        out = run(ctx)
+        self.assertEqual({k: v["want"] for k, v in out["summary"].items()}, {"w1": 1, "w2": 2, "w3": 2})
+        self.assertEqual(sorted({o["target"] for o in out["create"]}), ["w1", "w2", "w3"])
+
+    def test_no_sources_is_fine(self):
+        ctx = {"cfg": {"mode": "plan", "dry_run": "false"},
+               "read_targets": {"by_member": {"w1": {"items": [ev("a", T)]}, "w2": {"items": []}}}}
+        out = run(ctx)
+        self.assertEqual(out["summary"]["w2"]["want"], 1)
+
+    def test_calendar_in_both_lists_refused(self):
+        ctx = {"cfg": {"mode": "plan"},
+               "read_sources": {"by_member": {"x": {"items": []}}},
+               "read_targets": {"by_member": {"x": {"items": []}, "y": {"items": []}}}}
+        with self.assertRaisesRegex(RuntimeError, "both a source and a target: x"):
+            run(ctx)
 
 
 def cleanup(c1=(), c2=(), **cfg):
     c = {"mode": "cleanup", "now": NOW, "cleanup_apply": "true"}
     c.update(cfg)
-    return run({"cfg": c, "read_client_1": {"items": list(c1)}, "read_client_2": {"items": list(c2)}})
+    ctx = {"cfg": c, "read_targets": reads(c1=c1, c2=c2)["read_targets"]}
+    return per_target(run(ctx), ("delete", "patch"))
 
 
 class Cleanup(unittest.TestCase):
@@ -245,12 +295,18 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(len(cleanup(c2=[e])["client_2"]["delete"]), 1)
 
     def test_report_only_by_default(self):
-        out = run({"cfg": {"mode": "cleanup", "now": NOW}, "read_client_1": {"items": [ev(self.BB, "2026-11-25T10:00:00Z")]},
-                   "read_client_2": {"items": []}})
+        out = run({"cfg": {"mode": "cleanup", "now": NOW},
+                   "read_targets": reads(c1=[ev(self.BB, "2026-11-25T10:00:00Z")])["read_targets"]})
         self.assertFalse(out["apply"])
-        self.assertEqual(out["client_1"]["delete"], [])
+        self.assertEqual(out["delete"], [])
         self.assertEqual(out["summary"]["client_1"]["delete"], 1)
-        self.assertEqual(out["sample"]["client_1"]["delete"][0]["event_id"], self.BB)
+        self.assertEqual(out["sample"]["delete"][0], {"target": "client_1", "event_id": self.BB, "why": "future one-off"})
+
+    def test_fan_out_cap_leaves_remainder(self):
+        many = [ev("bb0123456789a%02d" % i, "2026-11-25T10:00:00Z") for i in range(5)]
+        out = cleanup(c1=many, max_fan_out="2")
+        self.assertEqual(len(out["delete"]), 2)
+        self.assertEqual(out["remaining"], 3)
 
     def test_cap(self):
         many = [ev("bb0123456789a%02d" % i, "2026-11-25T10:00:00Z") for i in range(5)]
@@ -266,11 +322,13 @@ class Backup(unittest.TestCase):
                ev("d", "2026-11-25", "2026-11-26", summary="Holiday"),
                ev("z", T, status="cancelled")]
         ctx = {"cfg": {"mode": "snapshots", "backup_prefix": "cal"}}
-        for s in ("personal_1", "personal_2", "client_1", "client_2"):
-            ctx["read_" + s] = {"items": evs}
+        ctx.update(reads(evs, evs, evs, evs))
         out = run(ctx)
-        self.assertEqual(len(out["snapshots"]), 8)
-        self.assertEqual(out["sets"][:2], ["cal-personal-1-json", "cal-personal-1-ics"])
+        self.assertEqual(len(out["snapshots"]), 9)
+        self.assertEqual(out["sets"][:2], ["cal-client_1-json", "cal-client_1-ics"])
+        index = out["snapshots"][-1]
+        self.assertEqual(index["set"], "cal-index")
+        self.assertEqual(json.loads(index["text"])["sets"], out["sets"])
         j, ics = out["snapshots"][0], out["snapshots"][1]
         self.assertEqual(json.loads(j["text"]), evs)
         self.assertEqual(ics["ext"], "ics")
@@ -298,21 +356,26 @@ class Manifest(unittest.TestCase):
         self.assertIs(s["dry_run"]["default"], True)
         self.assertEqual(s["lookahead_days"]["default"], 60)
 
-    def test_reads_cover_every_socket_the_plan_reads(self):
+    def test_reads_are_over_the_two_lists(self):
         steps = self.man["workflows"]["sync"]["steps"]
-        reads = [b[0]["id"] for s in steps if isinstance(s.get("parallel"), list) for b in s["parallel"]]
-        self.assertEqual(sorted(reads), ["read_client_1", "read_client_2", "read_personal_1", "read_personal_2"])
-        for s in steps:
-            if isinstance(s.get("parallel"), list):
-                for b in s["parallel"]:
-                    o = b[0]["options"]
-                    self.assertTrue(o["singleEvents"] and o["showDeleted"])
+        reads = [b[0] for s in steps if isinstance(s.get("parallel"), list) for b in s["parallel"]]
+        self.assertEqual(sorted(r["id"] for r in reads), ["read_sources", "read_targets"])
+        for r in reads:
+            self.assertTrue(r["over"])
+            self.assertTrue(r["options"]["singleEvents"] and r["options"]["showDeleted"])
 
-    def test_every_socket_is_declared(self):
+    def test_writes_go_to_the_ops_target(self):
+        writes = [s for s in self.man["workflows"]["sync"]["steps"] if str(s.get("id", "")).startswith("apply_")]
+        self.assertEqual(len(writes), 3)
+        for w in writes:
+            self.assertTrue(w["uses"].startswith("targets."))
+            self.assertEqual(w["member"], "{{.item.target}}")
+
+    def test_sockets(self):
         req = self.man["pack"]["requires"]["connectors"]
-        for s in ("personal_1", "personal_2", "client_1", "client_2", "cron", "backup"):
-            self.assertIn(s, req)
-
+        self.assertEqual(set(req), {"sources", "targets", "cron", "backup"})
+        self.assertTrue(req["sources"]["many"] and req["targets"]["many"])
+        self.assertEqual(req["targets"]["min"], 2)
 
 if __name__ == "__main__":
     unittest.main()

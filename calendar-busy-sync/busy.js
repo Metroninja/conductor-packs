@@ -2,20 +2,22 @@
 // (an IIFE: top-level `return` is the step's outputs). One file, three modes,
 // picked by the workflow's `cfg` step:
 //
-//   plan     the sync diff: which busy blocks to create / update / delete on
-//            each client calendar so it mirrors the other calendars
-//   cleanup  the one-time BusyBridge cleanup plan: delete its future blocks,
-//            end its recurring series at now, keep its past
+//   plan      the sync diff: which busy blocks to create / update / delete on
+//             each target calendar so it mirrors the others
+//   cleanup   the one-time BusyBridge cleanup plan: delete its future blocks,
+//             end its recurring series at now, keep its past
 //   snapshots per-calendar snapshots (raw JSON + ICS) to store
+//
+// Calendars arrive keyed by connector name, from `over:` read steps over the
+// pack's two list sockets: ctx.read_sources.by_member / read_targets.by_member
+// = { <connector>: { items: [...] } }. Every write op names its `target`
+// connector, which the workflow passes to `member:`.
 //
 // Everything here is pure: it reads ctx and returns data. The workflow does
 // the I/O with verb steps, so this file runs unchanged under node in tests.
 
 const cfg = ctx.cfg || {};
 const mode = cfg.mode;
-
-const PERSONAL = ["personal_1", "personal_2"];
-const CLIENTS = ["client_1", "client_2"];
 const MANAGED_KEY = "cbs"; // extendedProperties.private[MANAGED_KEY] === "1" marks our blocks
 
 function bool(v, dflt) {
@@ -27,10 +29,21 @@ function num(v, dflt) {
   const n = Number(v);
   return Number.isFinite(n) && v !== "" && v !== null ? n : dflt;
 }
-function items(id) {
+// calendars(id) → { <connector>: [events] } from an `over:` read step.
+function calendars(id, required) {
   const s = ctx[id];
-  if (!s || !Array.isArray(s.items)) throw new Error("step " + id + " returned no items");
-  return s.items;
+  const by = s && s.by_member;
+  if (!by || typeof by !== "object") {
+    if (required) throw new Error("step " + id + " returned no calendars");
+    return {};
+  }
+  const out = {};
+  for (const name of Object.keys(by).sort()) {
+    const r = by[name];
+    if (!r || !Array.isArray(r.items)) throw new Error("step " + id + ": " + name + " returned no items");
+    out[name] = r.items;
+  }
+  return out;
 }
 function priv(ev) {
   return (ev.extendedProperties && ev.extendedProperties.private) || {};
@@ -162,17 +175,21 @@ function planMode() {
   // policy.max_fan_out (100 by default) items.
   const maxFanOut = num(cfg.max_fan_out, 100);
 
-  const cal = {};
-  for (const s of PERSONAL.concat(CLIENTS)) cal[s] = items("read_" + s);
+  const personal = calendars("read_sources", false);
+  const targets = calendars("read_targets", true);
+  const both = Object.keys(personal).filter((n) => n in targets);
+  if (both.length) throw new Error("a calendar cannot be both a source and a target: " + both.join(", "));
+  const cal = Object.assign({}, personal, targets);
+  const targetNames = Object.keys(targets);
 
-  const out = { dry_run: dry, summary: {}, deferred: 0 };
+  const out = { dry_run: dry, summary: {}, deferred: 0, create: [], update: [], delete: [] };
   let writes = 0;
   const allDeletes = [];
 
-  for (const target of CLIENTS) {
-    // Sources for this target: every personal calendar, and every OTHER client.
-    const sources = PERSONAL.map((s) => [s, "personal"]).concat(
-      CLIENTS.filter((c) => c !== target).map((c) => [c, "client"]),
+  for (const target of targetNames) {
+    // Sources for this target: every personal calendar, and every OTHER target.
+    const sources = Object.keys(personal).map((s) => [s, "personal"]).concat(
+      targetNames.filter((c) => c !== target).map((c) => [c, "client"]),
     );
     // A meeting the target already holds natively (same iCalUID, same start,
     // not declined there) needs no block — it would only duplicate it.
@@ -196,23 +213,22 @@ function planMode() {
     const have = new Map();
     for (const ev of cal[target]) if (isOurs(ev)) have.set(ev.id, ev);
 
-    const create = [], update = [], del = [];
+    let nc = 0, nu = 0, nd = 0;
     for (const [id, body] of want) {
       const h = have.get(id);
-      if (!h) create.push({ event: body });
+      if (!h) { out.create.push({ target: target, event: body }); nc++; }
       else if (drifted(h, body)) {
         const patch = Object.assign({}, body, { status: "confirmed" });
         delete patch.id;
-        update.push({ event_id: id, event: patch });
+        out.update.push({ target: target, event_id: id, event: patch });
+        nu++;
       }
     }
     for (const [id, h] of have) {
       if (h.status === "cancelled") continue;
-      if (!want.has(id)) del.push({ event_id: id });
+      if (!want.has(id)) { const d = { target: target, event_id: id }; out.delete.push(d); allDeletes.push(d); nd++; }
     }
-    allDeletes.push(...del);
-    out.summary[target] = { want: want.size, have: have.size, create: create.length, update: update.length, delete: del.length };
-    out[target] = { create, update, delete: del };
+    out.summary[target] = { want: want.size, have: have.size, create: nc, update: nu, delete: nd };
   }
 
   if (allDeletes.length > maxDeletes) {
@@ -223,28 +239,22 @@ function planMode() {
   }
 
   // Cap the writes per run: deletes first (they free time), then creates, then
-  // updates. What is left over is picked up by the next run.
-  for (const target of CLIENTS) {
-    const ops = out[target];
-    for (const kind of ["delete", "create", "update"]) {
-      const room = Math.min(maxFanOut, Math.max(0, maxWrites - writes));
-      if (ops[kind].length > room) {
-        out.deferred += ops[kind].length - room;
-        ops[kind] = ops[kind].slice(0, room);
-      }
-      writes += ops[kind].length;
+  // updates. Each kind is ONE for_each step, so each is also held under
+  // policy.max_fan_out. What is left over is picked up by the next run.
+  for (const kind of ["delete", "create", "update"]) {
+    const room = Math.min(maxFanOut, Math.max(0, maxWrites - writes));
+    if (out[kind].length > room) {
+      out.deferred += out[kind].length - room;
+      out[kind] = out[kind].slice(0, room);
     }
+    writes += out[kind].length;
   }
   if (dry) {
-    out.would = {};
-    for (const target of CLIENTS) {
-      const ops = out[target];
-      out.would[target] = {
-        create: ops.create.slice(0, 10).map((o) => ({ from: o.event.extendedProperties.private.cbs_src, start: o.event.start })),
-        delete: ops.delete.slice(0, 10).map((o) => o.event_id),
-      };
-      out[target] = { create: [], update: [], delete: [] };
-    }
+    out.would = {
+      create: out.create.slice(0, 10).map((o) => ({ on: o.target, from: o.event.extendedProperties.private.cbs_src, start: o.event.start })),
+      delete: out.delete.slice(0, 10),
+    };
+    out.create = []; out.update = []; out.delete = [];
   }
   out.writes = dry ? 0 : writes;
   return out;
@@ -279,10 +289,10 @@ function cleanupMode() {
   const maxOps = num(cfg.cleanup_max_ops, 1000);
   const now = cfg.now ? new Date(cfg.now) : new Date();
   const nowMs = now.getTime();
-  const out = { apply: apply, summary: {} };
-  let total = 0;
-  for (const target of CLIENTS) {
-    const evs = items("read_" + target).filter((e) => e.status !== "cancelled" && isBusyBridge(e));
+  const out = { apply: apply, summary: {}, delete: [], patch: [] };
+  const targets = calendars("read_targets", true);
+  for (const target of Object.keys(targets)) {
+    const evs = targets[target].filter((e) => e.status !== "cancelled" && isBusyBridge(e));
     const masters = new Map();
     for (const e of evs) if (Array.isArray(e.recurrence) && e.recurrence.length) masters.set(e.id, e);
     const del = [], patch = [];
@@ -290,31 +300,35 @@ function cleanupMode() {
     let keptPast = 0;
     for (const m of masters.values()) {
       if (startMs(m) >= nowMs) {
-        del.push({ event_id: m.id, why: "series starts in the future" });
+        del.push({ target: target, event_id: m.id, why: "series starts in the future" });
         doomed.add(m.id);
       } else {
-        patch.push({ event_id: m.id, event: { recurrence: truncateRecurrence(m.recurrence, untilStamp(now, isAllDay(m))) } });
+        patch.push({ target: target, event_id: m.id, event: { recurrence: truncateRecurrence(m.recurrence, untilStamp(now, isAllDay(m))) } });
       }
     }
     for (const e of evs) {
       if (masters.has(e.id)) continue;
       if (e.recurringEventId && doomed.has(e.recurringEventId)) continue; // goes with its series
-      if (startMs(e) >= nowMs) del.push({ event_id: e.id, why: e.recurringEventId ? "future exception" : "future one-off" });
+      if (startMs(e) >= nowMs) del.push({ target: target, event_id: e.id, why: e.recurringEventId ? "future exception" : "future one-off" });
       else keptPast++;
     }
     out.summary[target] = { busybridge_events: evs.length, series: masters.size, delete: del.length, end_series: patch.length, kept_past: keptPast };
-    out[target] = { delete: del, patch: patch };
-    total += del.length + patch.length;
+    out.delete.push(...del);
+    out.patch.push(...patch);
   }
+  const total = out.delete.length + out.patch.length;
   if (total > maxOps) {
     throw new Error("cleanup would make " + total + " changes, over cleanup_max_ops " + maxOps + "; raise it to proceed");
   }
+  // Each list is one for_each step, held under policy.max_fan_out: a big
+  // cleanup takes a few runs (each run re-reads and does what is left).
+  const maxFanOut = num(cfg.max_fan_out, 100);
+  out.remaining = Math.max(0, out.delete.length - maxFanOut) + Math.max(0, out.patch.length - maxFanOut);
+  out.delete = out.delete.slice(0, maxFanOut);
+  out.patch = out.patch.slice(0, maxFanOut);
   if (!apply) {
-    for (const target of CLIENTS) {
-      out.sample = out.sample || {};
-      out.sample[target] = { delete: out[target].delete.slice(0, 10), end_series: out[target].patch.slice(0, 10).map((p) => p.event_id) };
-      out[target] = { delete: [], patch: [] };
-    }
+    out.sample = { delete: out.delete.slice(0, 10), end_series: out.patch.slice(0, 10).map((p) => p.target + ":" + p.event_id) };
+    out.delete = []; out.patch = [];
   }
   return out;
 }
@@ -368,13 +382,18 @@ function toICS(name, evs) {
 function backupMode() {
   const prefix = cfg.backup_prefix || "calendar";
   const snaps = [];
-  for (const s of PERSONAL.concat(CLIENTS)) {
-    const evs = items("read_" + s);
-    const set = prefix + "-" + s.replace(/_/g, "-");
+  const cal = Object.assign({}, calendars("read_sources", false), calendars("read_targets", true));
+  for (const s of Object.keys(cal).sort()) {
+    const evs = cal[s];
+    const set = prefix + "-" + s.replace(/[^A-Za-z0-9._-]/g, "-");
     snaps.push({ set: set + "-json", ext: "json", text: JSON.stringify(evs) });
     snaps.push({ set: set + "-ics", ext: "ics", text: toICS(s, evs) });
   }
-  return { snapshots: snaps, sets: snaps.map((x) => x.set) };
+  // The index lists every set, so the restore test knows what to verify
+  // without reading the calendars.
+  const sets = snaps.map((x) => x.set);
+  snaps.push({ set: prefix + "-index", ext: "json", text: JSON.stringify({ sets: sets }) });
+  return { snapshots: snaps, sets: sets };
 }
 
 switch (mode) {

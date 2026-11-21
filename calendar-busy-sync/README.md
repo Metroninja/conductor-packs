@@ -5,17 +5,19 @@ calendar people book you through shows the time you're taken on the others.
 It follows BusyBridge's "Ghost Main" rules. There is no UI and no database:
 the calendars themselves are the state.
 
-| socket | role |
+You give it two lists of google-calendar connectors, as many as you like in each:
+
+| list | role |
 |---|---|
-| `personal_1`, `personal_2` | read-only sources (e.g. a personal Gmail, a calendar at another org) |
-| `client_1`, `client_2` | receive busy blocks, and each is a source for the other |
+| `sources` | read-only calendars (e.g. a personal Gmail, a calendar at another org) |
+| `targets` (2 or more) | receive busy blocks, and each is a source for every other target |
 
 ## Rules
 
 | source | blocks | all-day | marked Free | declined / out-of-office / `[nosync]` |
 |---|---|---|---|---|
-| personal | both clients | skipped (`sync_personal_all_day`) | **still blocks** | skipped |
-| client | the other client | blocks | skipped | skipped |
+| a source | every target | skipped (`sync_personal_all_day`) | **still blocks** | skipped |
+| a target | every other target | blocks | skipped | skipped |
 
 - **What a block looks like.** Title `Busy`, opaque, private, description
   `[Busy]`. It carries no other detail from the source.
@@ -29,7 +31,7 @@ the calendars themselves are the state.
 ## How it works
 
 - **Each run recomputes everything.** It reads every calendar's window
-  (expanded instances), computes the blocks each client should hold, and
+  (expanded instances), computes the blocks each target should hold, and
   diffs them against the blocks it holds now. Then it deletes, creates, and
   repairs the difference.
 - **Block ids are deterministic.** Each id is `cbs` + 32 hex, derived from
@@ -44,21 +46,27 @@ the calendars themselves are the state.
 - **Guards:**
   - `max_writes` (200) per run. Leftovers wait for the next run, so the first
     fill takes a few runs.
-  - `max_fan_out` (100) per list.
+  - `max_fan_out` (100) per kind of write (delete / create / update).
   - `max_deletes` (50): a run that would delete more fails instead. A source
     calendar that read back empty looks exactly like a mass delete.
 - **`dry_run` is on by default.** The run log shows what it would write.
 
 ## Install
 
-You need conductor ≥ 0.105, google-calendar ≥ 1.2.0 (it follows every result
-page), and backup ≥ 1.0.0.
+You need conductor ≥ 0.106 (list sockets), google-calendar ≥ 1.2.0 (it
+follows every result page), and backup ≥ 1.0.0.
 
 ```yaml
+vaults:
+  # One token vault per account, so one connector can't read another's token.
+  gcal-gmail:       { type: conductor }
+  gcal-tap:         { type: conductor }
+  gcal-teachermade: { type: conductor }
+  gcal-ednition:    { type: conductor }
+
 connectors:
-  # One google-calendar connector per account. All four share one Google
+  # One google-calendar connector per account. They all share one Google
   # OAuth client (Desktop app, redirect http://localhost:8400/callback).
-  # Each connector keeps its own token (token_vault).
   gcal-gmail:
     use: google-calendar
     auth:
@@ -89,11 +97,9 @@ packs:
   busy:
     source: github.com/NodeSpy/conductor-packs//calendar-busy-sync
     version: "~> 1.0"
-    connectors:            # four of one type, so each is bound by name
-      personal_1: gcal-gmail
-      personal_2: gcal-tap
-      client_1: gcal-teachermade
-      client_2: gcal-ednition
+    connectors:
+      sources: [gcal-gmail, gcal-tap]               # any number, each named
+      targets: [gcal-teachermade, gcal-ednition]    # at least two
       cron: timer
       backup: calbackup
     settings:
@@ -118,7 +124,8 @@ conductor validate
 
 **Push** needs a public https URL that Google can post to. Use `expose:` with an
 exposure connector (tailscale funnel, cloudflared, ngrok), or set `address:`.
-The connector opens the `events.watch` channel, renews it before it expires,
+A push from any calendar in either list starts a sync. The connector opens the
+`events.watch` channel, renews it before it expires,
 and stops it on shutdown. Without `watch:` the `changed` source stays idle and
 the cron does all the work.
 
@@ -139,12 +146,13 @@ triggers:
 
 - **Nightly snapshots.** `backup` writes two snapshots per calendar into the
   backup connector's tiers:
-  - `calendar-<socket>-json`: the raw API events, lossless and re-insertable.
-  - `calendar-<socket>-ics`: for any calendar app.
+  - `calendar-<connector>-json`: the raw API events, lossless and re-insertable.
+  - `calendar-<connector>-ics`: for any calendar app.
+  - `calendar-index`: the list of sets, which the restore test reads.
 - **What they cover.** A year back to two years ahead, with recurring events
   kept as series.
 - **Unchanged snapshots are skipped.** Each tier's retention then applies.
-- **Weekly restore test.** `verify` restores each set's newest snapshot from
+- **Weekly restore test.** `verify` restores the index, then each set's newest snapshot from
   every tier, checks its sha256 and size, and runs the backend's own check.
   The run fails if anything doesn't match.
 
@@ -166,8 +174,9 @@ Don't let the two run side by side. Each would mirror the other's blocks.
      occurrences stay
    - leaves past one-offs alone
 
-   It refuses more than `cleanup_max_ops` (1000) changes. Run it again to
-   finish anything that failed.
+   It refuses more than `cleanup_max_ops` (1000) changes in total, and makes
+   at most `max_fan_out` (100) of each kind per run. The log says how many
+   remain; run it again until none do, or to retry anything that failed.
 4. **Go live.** Set `dry_run: false`. The first syncs fill the next 60 days
    (`max_writes` per run).
 
@@ -180,11 +189,11 @@ Don't let the two run side by side. Each would mirror the other's blocks.
 | `busy_title` | `Busy` | block title |
 | `managed_tag` | `[Busy]` | block description (search for it to find every block) |
 | `nosync_tag` | `[nosync]` | opt an event out (description, any case) |
-| `sync_personal_all_day` | `false` | mirror personal all-day events |
+| `sync_personal_all_day` | `false` | mirror all-day events from `sources` |
 | `sync_out_of_office` | `false` | mirror out-of-office events |
 | `max_writes` | `200` | writes per run |
 | `max_deletes` | `50` | fail rather than delete more |
-| `max_fan_out` | `100` | per write list; keep ≤ `policy.max_fan_out` |
+| `max_fan_out` | `100` | per kind of write; keep ≤ `policy.max_fan_out` |
 | `backup_tiers` | all | comma-separated tiers for backup/verify |
 | `backup_prefix` | `calendar` | set-name prefix |
 | `backup_days_back` / `_ahead` | `365` / `730` | backup window |
