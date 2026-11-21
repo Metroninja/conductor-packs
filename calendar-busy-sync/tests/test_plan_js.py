@@ -25,6 +25,7 @@ CFG = {
     "tag": TAG,
     "max_deletes": "50",
     "batch_size": "50",
+    "remove_all": "false",
 }
 
 
@@ -184,10 +185,59 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(out["pending"], 0)
         self.assertNotIn("left for later", out["summary"])
 
+    def test_time_already_blocked_by_hand_gets_no_block(self):
+        # The same commitment entered separately on both calendars.
+        p, w = ev("p1", T1, T2), ev("w1", "2026-12-01T08:00:00-07:00", "2026-12-01T09:00:00-07:00")
+        out = plan({"personal": [p], "work": [w]}, {"work": [w], "personal": [p]})
+        self.assertEqual((out["creates"], out["updates"], out["deletes"]), ([], [], []))
+        self.assertIn("2 already blocked on the target", out["summary"])
+
+    def test_a_longer_event_on_the_target_covers_a_shorter_one(self):
+        w = ev("w1", "2026-12-01T14:00:00Z", "2026-12-01T17:00:00Z")
+        out = plan({"personal": [ev("p1", T1, T2)]}, {"work": [w]})
+        self.assertEqual(out["creates"], [])
+
+    def test_partial_overlap_still_gets_a_block(self):
+        w = ev("w1", "2026-12-01T15:30:00Z", "2026-12-01T16:30:00Z")
+        out = plan({"personal": [ev("p1", T1, T2)]}, {"work": [w]})
+        self.assertEqual(len(out["creates"]), 1)
+
+    def test_free_or_declined_target_events_do_not_cover(self):
+        for extra in ({"transparency": "transparent"},
+                      {"attendees": [{"self": True, "responseStatus": "declined"}]}):
+            out = plan({"personal": [ev("p1", T1, T2)]}, {"work": [ev("w1", T1, T2, **extra)]})
+            self.assertEqual(len(out["creates"]), 1, extra)
+
+    def test_a_block_does_not_count_as_the_targets_own_time(self):
+        have = block("b1", "personal/p1", T1, T2)
+        out = plan({"personal": [ev("p1", T1, T2)]}, {"work": [have]})
+        self.assertEqual((out["creates"], out["deletes"]), ([], []))
+
+    def test_redundant_blocks_are_removed_whatever_their_number(self):
+        # Blocks made before the target's own events were taken into account.
+        src = [ev("p%d" % i, T1, T2) for i in range(5)]
+        have = [block("b%d" % i, "personal/p%d" % i, T1, T2) for i in range(5)]
+        out = plan({"personal": src}, {"work": have + [ev("w1", T1, T2)]}, max_deletes="1")
+        self.assertEqual(len(out["deletes"]), 5)
+        self.assertEqual(out["creates"], [])
+
     def test_mass_delete_is_refused(self):
         have = [block("b%d" % i, "personal/p%d" % i, T1, T2) for i in range(4)]
         with self.assertRaisesRegex(RuntimeError, "refusing to delete 4 blocks"):
             plan({"personal": []}, {"work": have}, max_deletes="3")
+
+    def test_unbinding_a_source_removes_its_blocks_without_tripping_the_guard(self):
+        have = [block("b%d" % i, "side/s%d" % i, T1, T2) for i in range(4)]
+        out = plan({"personal": []}, {"work": have}, max_deletes="1")
+        self.assertEqual(len(out["deletes"]), 4)
+
+    def test_remove_all_clears_every_block_and_creates_none(self):
+        have = [block("b%d" % i, "personal/p%d" % i, T1, T2) for i in range(4)]
+        out = plan({"personal": [ev("p9", T1, T2)]}, {"work": have + [ev("w1", T1, T2)]},
+                   remove_all="true", max_deletes="1")
+        self.assertEqual(sorted(d["event_id"] for d in out["deletes"]), ["b0", "b1", "b2", "b3"])
+        self.assertEqual((out["creates"], out["updates"]), ([], []))
+        self.assertIn("remove_all is on", out["summary"])
 
 
 class WindowTest(unittest.TestCase):

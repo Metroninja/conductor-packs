@@ -81,7 +81,11 @@ settings:
   max_deletes:
     type: integer
     default: 50
-    desc: "Refuse a run that would delete more than this many blocks — a guard against a bad read wiping every block."
+    desc: "Refuse a run that would delete more than this many blocks whose source events have vanished — a guard against a bad read wiping every block."
+  remove_all:
+    type: boolean
+    default: false
+    desc: "Remove every block in the window instead of syncing. Leave it on for a few sweeps before uninstalling, then disarm."
   batch_size:
     type: integer
     default: 50
@@ -109,6 +113,7 @@ workflows:
           tag: "${settings.tag}"
           max_deletes: "${settings.max_deletes}"
           batch_size: "${settings.batch_size}"
+          remove_all: "${settings.remove_all}"
 
       - id: window
         use: js
@@ -153,6 +158,7 @@ workflows:
           const yes = (v) => String(v) === "true";
           const showDetails = yes(cfg.show_details);
           const mirrorAllDay = yes(cfg.mirror_all_day);
+          const removeAll = yes(cfg.remove_all);
           const maxDeletes = parseInt(cfg.max_deletes, 10);
           const batch = parseInt(cfg.batch_size, 10);
           if (!(batch > 0)) throw new Error("batch_size must be a positive integer");
@@ -172,17 +178,17 @@ workflows:
           // events expanded, the start pins the occurrence.
           const meeting = (e) => (e.iCalUID ? e.iCalUID + "@" + edge(e.start) : "");
 
-          // What blocks time: a real event (never one of our own blocks) that
-          // shows as busy and that you have not declined.
-          const blocks = (e) => {
+          // Busy: a real event (never one of our own blocks) that shows as
+          // busy and that you have not declined.
+          const busy = (e) => {
             if (!live(e) || tagOf(e)) return false;
             if (e.transparency === "transparent") return false;
             if (e.eventType === "workingLocation") return false;
-            if (e.start.date && !mirrorAllDay) return false;
             const me = (e.attendees || []).find((a) => a.self);
-            if (me && me.responseStatus === "declined") return false;
-            return true;
+            return !(me && me.responseStatus === "declined");
           };
+          // What gets a block on the other calendars.
+          const blocks = (e) => busy(e) && !(e.start.date && !mirrorAllDay);
 
           const when = (t) => {
             if (t.date) return { date: t.date };
@@ -213,17 +219,37 @@ workflows:
 
           const creates = [], updates = [], deletes = [];
           const wanted = {};   // "<source> -> <target>": blocks that should exist, for the log line
+          let covered = 0;     // source events the target had already blocked itself
+          let vanished = 0;    // blocks going because their source event is no longer returned
           const srcNames = Object.keys(srcBy).sort();
           const dstNames = Object.keys(dstBy).sort();
+
+          // Every event the source calendars returned, whether or not it earns a block.
+          const present = new Set();
+          for (const source of srcNames) {
+            for (const e of itemsOf(srcBy[source])) if (e && e.id) present.add(source + "/" + e.id);
+          }
 
           for (const target of dstNames) {
             const existing = itemsOf(dstBy[target]).filter(live);
             const held = new Set(existing.filter((e) => !tagOf(e)).map(meeting).filter(Boolean));
 
+            // Time the target already shows as busy on its own. A source event
+            // that sits wholly inside one of these needs no block: you blocked
+            // it by hand, or the same commitment is on both calendars as two
+            // separate events.
+            const own = existing.filter(busy);
+            const timed = own.filter((e) => e.start.dateTime)
+              .map((e) => [Date.parse(e.start.dateTime), Date.parse(e.end.dateTime)]);
+            const days = own.filter((e) => e.start.date).map((e) => [e.start.date, e.end.date]);
+            const alreadyBusy = (e) => (e.start.dateTime
+              ? timed.some(([a, b]) => a <= Date.parse(e.start.dateTime) && b >= Date.parse(e.end.dateTime))
+              : days.some(([a, b]) => a <= e.start.date && b >= e.end.date));
+
             // Which blocks SHOULD be on this target, keyed "<source>/<event id>".
             const want = new Map();
             const seen = new Set();
-            for (const source of srcNames) {
+            for (const source of removeAll ? [] : srcNames) {
               if (source === target) continue;
               for (const e of itemsOf(srcBy[source])) {
                 if (!blocks(e)) continue;
@@ -231,6 +257,7 @@ workflows:
                 // The target already has this meeting itself, or another
                 // source already supplied a block for it.
                 if (m && (held.has(m) || seen.has(m))) continue;
+                if (alreadyBusy(e)) { covered++; continue; }
                 if (m) seen.add(m);
                 const key = source + "/" + e.id;
                 want.set(key, body(key, e));
@@ -247,6 +274,8 @@ workflows:
               if (!key) continue;
               if (!want.has(key) || kept.has(key)) {
                 deletes.push({ target, event_id: e.id });
+                // Its source calendar is still bound, yet the event is gone.
+                if (!want.has(key) && !present.has(key) && srcNames.includes(key.split("/")[0])) vanished++;
                 continue;
               }
               kept.add(key);
@@ -258,10 +287,14 @@ workflows:
             }
           }
 
-          if (deletes.length > maxDeletes) {
+          // Blocks going because their event was cancelled, or because a source
+          // came back empty. The two look alike, so a large number stops the run.
+          // Blocks going for a reason the plan can see (declined, marked free,
+          // already blocked on the target, source unbound) are not counted.
+          if (!removeAll && vanished > maxDeletes) {
             throw new Error(
-              "refusing to delete " + deletes.length + " blocks (max_deletes is " + maxDeletes +
-              "); check the source calendars read correctly, or raise max_deletes"
+              "refusing to delete " + vanished + " blocks whose source events are gone (max_deletes is " +
+              maxDeletes + "); check the source calendars read correctly, or raise max_deletes"
             );
           }
           // A run does at most `batch` of each; a for_each over more than
@@ -277,6 +310,8 @@ workflows:
             summary: creates.length + " to create, " + updates.length + " to move, " + deletes.length +
               " to remove across " + dstNames.length + " target(s) from " + srcNames.length + " source(s)" +
               "; blocks wanted: " + (Object.keys(wanted).sort().map((k) => k + " " + wanted[k]).join(", ") || "none") +
+              (covered ? "; " + covered + " already blocked on the target" : "") +
+              (removeAll ? "; remove_all is on" : "") +
               (left ? "; batch_size " + batch + ", " + left + " left for later runs" : ""),
           };
 

@@ -29,9 +29,11 @@ What counts as busy: an event that shows as busy and that you have not
 declined. Skipped: events marked free, declined invitations, working-location
 entries, and all-day events (unless `mirror_all_day` is on).
 
-It does not double up. A calendar never gets a block for its own events, a
-block is never copied onward, and a meeting you are invited to on two accounts
-gets no block on either, since both calendars already hold it.
+It does not double up. A calendar never gets a block for its own events, and a
+block is never copied onward. Time the target already shows as busy gets no
+block either: a meeting you are invited to on both accounts, or a slot you had
+already blocked by hand on both calendars. If the target's own event goes away
+later, the block appears on the next run.
 
 ## Requires
 
@@ -202,7 +204,8 @@ When the split looks right, remove `dry_run` and reload.
 | `color_id` | `8` | Google event colour for blocks (1–11; 8 is graphite). Empty keeps the calendar's colour |
 | `mirror_all_day` | `false` | Also mirror all-day events that are marked busy |
 | `tag` | `conductorBusySync` | Extended-property name marking a block as this pack's |
-| `max_deletes` | `50` | A run that would delete more blocks than this fails instead |
+| `max_deletes` | `50` | A run that would delete more than this many blocks whose source events have vanished fails instead |
+| `remove_all` | `false` | Remove every block in the window instead of syncing |
 | `batch_size` | `50` | Most blocks created, moved or removed per run. The rest follow on the next runs. Keep it under your `policy.max_fan_out` (100 by default) |
 | `dry_run` | `false` | Plan and log only |
 
@@ -214,9 +217,15 @@ When the split looks right, remove `dry_run` and reload.
   `color_id` keeps them in the background.
 - **Blocks are private and silent**: visibility `private`, no reminders, no
   attendees, so nobody is notified.
-- **Removing a calendar from `sources` removes its blocks** on the next run.
-  Uninstalling the pack does not; the blocks it already wrote stay until you
-  delete them.
+- **Blocks are single events, never a series**, even when the source event
+  repeats. Each occurrence can be moved, cancelled or declined on its own, and
+  one block per occurrence follows that without exceptions to track. You should
+  not need to tidy them by hand: a block goes on its own as soon as it is no
+  longer needed.
+- **To clear every block**, set `remove_all: true` and leave it for a few
+  sweeps (each removes `batch_size` blocks). Do this before uninstalling;
+  uninstalling alone leaves the blocks in place.
+- **Removing a calendar from `sources` removes its blocks** over the next runs.
 - **Renaming a connector re-creates its blocks**, since a block is keyed by the
   source connector's name.
 - **Two runs at once can create a duplicate block.** The next run removes it.
