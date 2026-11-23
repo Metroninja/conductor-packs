@@ -20,10 +20,18 @@ One workflow, `reconcile`, shared by two triggers:
 | `sweep` | your `busy_sync` cron schedule | Google push is best-effort and nothing arrives while the daemon is down; the sweep also rolls the window forward |
 
 Each run reads every source and target for the next `window_days`, works out
-which blocks should exist, and creates, moves or removes blocks until the
+which blocks should exist, and creates, changes or removes blocks until the
 targets match. It keeps no state of its own: a block carries a private extended
 property naming the source event it stands for, so a second run is a no-op and
 a missed run is caught up by the next one.
+
+A repeating event gets **one repeating block**, not one block per occurrence.
+The block copies the event's own recurrence rule, starts at the first
+occurrence still ahead, and leaves out the occurrences that need no block:
+cancelled, declined, moved (a moved one gets a block of its own where it
+went), or already busy on the target. Two cases fall back to a block per
+occurrence: a rule that ends after a set number of times (`COUNT`), and a
+series where most of the occurrences ahead need no block.
 
 What counts as busy: an event that shows as busy and that you have not
 declined. Skipped: events marked free, declined invitations, working-location
@@ -189,8 +197,14 @@ times.
 Start with `dry_run: true` and read the plan line in the daemon log:
 
 ```
-calendar-busy-sync: 20 to create, 0 to move, 0 to remove across 2 target(s) from 3 source(s); blocks wanted: cal-personal -> cal-side 10, cal-personal -> cal-work 10
+calendar-busy-sync: 14 to create, 0 to change, 0 to remove across 2 target(s) from 3 source(s); occurrences to block: cal-personal -> cal-side 10, cal-personal -> cal-work 10; 4 repeating block(s); 20 occurrence(s) not yet in step
 ```
+
+"Occurrences to block" counts calendar slots; "to create" counts events, and a
+repeating block is one event however many slots it covers. "Not yet in step"
+is how many slots still differ from the plan: it drops to zero once the runs
+have caught up, and a number that stays up means a block is not landing where
+the plan expects.
 
 When the split looks right, remove `dry_run` and reload.
 
@@ -217,11 +231,13 @@ When the split looks right, remove `dry_run` and reload.
   `color_id` keeps them in the background.
 - **Blocks are private and silent**: visibility `private`, no reminders, no
   attendees, so nobody is notified.
-- **Blocks are single events, never a series**, even when the source event
-  repeats. Each occurrence can be moved, cancelled or declined on its own, and
-  one block per occurrence follows that without exceptions to track. You should
-  not need to tidy them by hand: a block goes on its own as soon as it is no
-  longer needed.
+- **A repeating block reaches past the window.** It follows the event's rule
+  for as long as that runs, so a change to one occurrence months out (a
+  decline, a cancellation) only reaches the block once that occurrence comes
+  within `window_days`.
+- **You should not need to tidy blocks by hand.** A block goes on its own as
+  soon as it is no longer needed. If you do delete one, the next run puts it
+  back while its event still needs it.
 - **To clear every block**, set `remove_all: true` and leave it for a few
   sweeps (each removes `batch_size` blocks). Do this before uninstalling;
   uninstalling alone leaves the blocks in place.
@@ -234,7 +250,7 @@ When the split looks right, remove `dry_run` and reload.
   which would stop a sweep after six runs. The pack's triggers set that limit
   out of reach and run one at a time.
 - **A big first sync takes a few runs.** Each run writes at most `batch_size`
-  blocks, so a calendar needing 130 fills in over three sweeps.
+  blocks, so 130 new blocks fill in over three sweeps.
 - **Past blocks are left in place.** Only the window ahead is reconciled.
 
 ## Tests

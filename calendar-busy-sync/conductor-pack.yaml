@@ -4,7 +4,8 @@
 # a SOURCE calendar gets a "Busy" block on every other TARGET calendar, so a
 # colleague looking at your work calendar sees the time your personal (or other
 # job's) calendar already holds. Blocks follow the source: moved when it moves,
-# removed when it is cancelled, declined, or marked free.
+# removed when it is cancelled, declined, or marked free. A repeating event
+# gets one repeating block.
 #
 # Pure verbs + two small js steps — no agent, no model, no cost.
 #
@@ -122,14 +123,19 @@ workflows:
           if (!(days > 0)) throw new Error("window_days must be a positive integer");
           const now = new Date();
           if (now.getUTCFullYear() < 2025) throw new Error("js clock looks wrong: " + now.toISOString());
+          // Clearing reaches back a year as well, to take blocks already past.
+          const back = String(ctx.cfg.remove_all) === "true" ? 366 : 0;
           return {
-            timeMin: now.toISOString(),
+            timeMin: new Date(now.getTime() - back * 86400000).toISOString(),
             timeMax: new Date(now.getTime() + days * 86400000).toISOString(),
           };
 
-      # Recurring events are expanded (singleEvents) so each occurrence is its
-      # own block. A failed read fails the run here — nothing is deleted on a
-      # partial picture.
+      # Every calendar is read twice. EXPANDED (singleEvents), each occurrence
+      # of a repeating event is its own item: that decides which occurrences
+      # need a block. RAW, a repeating event is one item carrying its recurrence
+      # rule, plus one item per changed or cancelled occurrence: that is what
+      # lets a repeating event get ONE repeating block instead of dozens.
+      # A failed read fails the run here — nothing is deleted on a partial picture.
       - id: src
         uses: sources.events
         over: true
@@ -139,8 +145,17 @@ workflows:
           singleEvents: true
           maxResults: 2500
 
+      - id: srcraw
+        uses: sources.events
+        over: true
+        options:
+          timeMin: "{{.window.timeMin}}"
+          timeMax: "{{.window.timeMax}}"
+          singleEvents: false
+          maxResults: 2500
+
       # The targets are read whole (not just this pack's blocks): the plan also
-      # needs to know when a target already holds the very meeting a source has.
+      # needs the target's own events, to leave alone time it already has busy.
       - id: dst
         uses: targets.events
         over: true
@@ -150,11 +165,21 @@ workflows:
           singleEvents: true
           maxResults: 2500
 
+      - id: dstraw
+        uses: targets.events
+        over: true
+        options:
+          timeMin: "{{.window.timeMin}}"
+          timeMax: "{{.window.timeMax}}"
+          singleEvents: false
+          maxResults: 2500
+
       - id: plan
         use: js
         code: |
           const cfg = ctx.cfg;
           const TAG = cfg.tag;
+          const SIG = TAG + "Sig";
           const yes = (v) => String(v) === "true";
           const showDetails = yes(cfg.show_details);
           const mirrorAllDay = yes(cfg.mirror_all_day);
@@ -165,17 +190,18 @@ workflows:
 
           const members = (o) => (o && o.by_member) || {};
           const itemsOf = (v) => (Array.isArray(v) ? v : (v && v.items) || []);
-          const srcBy = members(ctx.src);
-          const dstBy = members(ctx.dst);
+          const srcBy = members(ctx.src), srcRawBy = members(ctx.srcraw);
+          const dstBy = members(ctx.dst), dstRawBy = members(ctx.dstraw);
 
-          const tagOf = (e) =>
-            (e && e.extendedProperties && e.extendedProperties.private && e.extendedProperties.private[TAG]) || "";
+          const priv = (e) => (e && e.extendedProperties && e.extendedProperties.private) || {};
+          const tagOf = (e) => priv(e)[TAG] || "";
           const live = (e) => e && e.status !== "cancelled" && e.start && e.end;
           // One instant per event edge, comparable across calendars: a target
           // hands a dateTime back in its own zone's offset.
           const edge = (t) => (t.dateTime ? String(Date.parse(t.dateTime)) : "d" + t.date);
-          // The same meeting on two calendars shares an iCalUID; with recurring
-          // events expanded, the start pins the occurrence.
+          const len = (e) => Date.parse(e.end.dateTime || e.end.date) - Date.parse(e.start.dateTime || e.start.date);
+          // The same meeting on two calendars shares an iCalUID; the start pins
+          // the occurrence.
           const meeting = (e) => (e.iCalUID ? e.iCalUID + "@" + edge(e.start) : "");
 
           // Busy: a real event (never one of our own blocks) that shows as
@@ -190,17 +216,10 @@ workflows:
           // What gets a block on the other calendars.
           const blocks = (e) => busy(e) && !(e.start.date && !mirrorAllDay);
 
-          const when = (t) => {
-            if (t.date) return { date: t.date };
-            const out = { dateTime: t.dateTime };
-            if (t.timeZone) out.timeZone = t.timeZone;
-            return out;
-          };
-          const body = (key, e) => {
+          const title = (e) => (showDetails && e.summary ? e.summary : cfg.block_title);
+          const shell = (key, summary) => {
             const b = {
-              summary: showDetails && e.summary ? e.summary : cfg.block_title,
-              start: when(e.start),
-              end: when(e.end),
+              summary,
               transparency: "opaque",
               visibility: "private",
               reminders: { useDefault: false, overrides: [] },
@@ -209,18 +228,72 @@ workflows:
             if (cfg.color_id) b.colorId = cfg.color_id;
             return b;
           };
-          const same = (have, want) =>
-            edge(have.start) === edge(want.start) &&
-            edge(have.end) === edge(want.end) &&
-            (have.summary || "") === want.summary &&
-            (have.transparency || "opaque") === "opaque" &&
-            have.visibility === "private" &&
-            (!want.colorId || have.colorId === want.colorId);
+          const when = (t) => {
+            if (t.date) return { date: t.date };
+            const out = { dateTime: t.dateTime };
+            if (t.timeZone) out.timeZone = t.timeZone;
+            return out;
+          };
+          // A block for one event or one occurrence.
+          const single = (key, e) => Object.assign(shell(key, title(e)), { start: when(e.start), end: when(e.end) });
+
+          // A repeating event can be mirrored as one repeating block when its
+          // rule can be copied as it stands. A COUNT rule cannot: the block
+          // starts at the first occurrence still ahead, which would restart
+          // the count. Those fall back to one block per occurrence.
+          const repeats = (m) => !!m && Array.isArray(m.recurrence) && m.recurrence.length > 0 &&
+            !m.recurrence.some((r) => /[:;]COUNT=/i.test(r)) && !!(m.start && (m.start.date || m.start.timeZone));
+          const pad = (n) => String(n).padStart(2, "0");
+          // The RFC 5545 line that leaves one occurrence out, by its original start.
+          const exdate = (t) => {
+            if (t.date) return "EXDATE;VALUE=DATE:" + t.date.replace(/-/g, "");
+            const d = new Date(Date.parse(t.dateTime));
+            return "EXDATE:" + d.getUTCFullYear() + pad(d.getUTCMonth() + 1) + pad(d.getUTCDate()) + "T" +
+              pad(d.getUTCHours()) + pad(d.getUTCMinutes()) + pad(d.getUTCSeconds()) + "Z";
+          };
+          const hash = (s) => {
+            let a = 2166136261, b = 5381;
+            for (let i = 0; i < s.length; i++) {
+              const c = s.charCodeAt(i);
+              a = Math.imul(a ^ c, 16777619) >>> 0;
+              b = (Math.imul(b, 33) + c) >>> 0;
+            }
+            return a.toString(16) + b.toString(16);
+          };
+          // A repeating block: the source's own rule, starting at the first
+          // occurrence that needs it, minus the occurrences that do not. Google
+          // may hand a rule back reworded, so the block carries a signature of
+          // what it was built from, and that is what a later run compares.
+          const series = (key, master, first, skipped) => {
+            const rules = master.recurrence.concat(Array.from(new Set(skipped.map(exdate))).sort());
+            const b = shell(key, title(master));
+            if (first.start.date) {
+              b.start = { date: first.start.date };
+              b.end = { date: first.end.date };
+            } else {
+              b.start = { dateTime: first.start.dateTime, timeZone: master.start.timeZone };
+              b.end = { dateTime: first.end.dateTime, timeZone: (master.end && master.end.timeZone) || master.start.timeZone };
+            }
+            b.recurrence = rules;
+            b.extendedProperties.private[SIG] = hash(JSON.stringify([master.start, master.end, rules]));
+            return b;
+          };
+          const same = (have, want) => {
+            if (!!have.recurrence !== !!want.recurrence) return false;
+            const look = (have.summary || "") === want.summary &&
+              (have.transparency || "opaque") === "opaque" &&
+              have.visibility === "private" &&
+              (!want.colorId || have.colorId === want.colorId);
+            if (want.recurrence) return look && priv(have)[SIG] === want.extendedProperties.private[SIG];
+            return look && edge(have.start) === edge(want.start) && edge(have.end) === edge(want.end);
+          };
 
           const creates = [], updates = [], deletes = [];
-          const wanted = {};   // "<source> -> <target>": blocks that should exist, for the log line
-          let covered = 0;     // source events the target had already blocked itself
+          const wanted = {};   // "<source> -> <target>": occurrences that should be blocked, for the log line
+          let covered = 0;     // occurrences the target had already blocked itself
           let vanished = 0;    // blocks going because their source event is no longer returned
+          let repeating = 0;   // repeating blocks wanted
+          let adrift = 0;      // occurrences blocked but not wanted, or wanted but not blocked
           const srcNames = Object.keys(srcBy).sort();
           const dstNames = Object.keys(dstBy).sort();
 
@@ -228,6 +301,7 @@ workflows:
           const present = new Set();
           for (const source of srcNames) {
             for (const e of itemsOf(srcBy[source])) if (e && e.id) present.add(source + "/" + e.id);
+            for (const e of itemsOf(srcRawBy[source])) if (e && e.id) present.add(source + "/" + e.id);
           }
 
           for (const target of dstNames) {
@@ -246,32 +320,97 @@ workflows:
               ? timed.some(([a, b]) => a <= Date.parse(e.start.dateTime) && b >= Date.parse(e.end.dateTime))
               : days.some(([a, b]) => a <= e.start.date && b >= e.end.date));
 
-            // Which blocks SHOULD be on this target, keyed "<source>/<event id>".
+            // Which blocks SHOULD be on this target: "<source>/<event id>" for
+            // one event or occurrence, "<source>/<repeating event id>" for a
+            // repeating block.
             const want = new Map();
             const seen = new Set();
+            const due = {};   // start -> occurrences that should be blocked then
+            const add = (source, n) => {
+              const pair = source + " -> " + target;
+              wanted[pair] = (wanted[pair] || 0) + n;
+            };
+            const one = (source, e) => {
+              const key = source + "/" + e.id;
+              want.set(key, single(key, e));
+              due[edge(e.start)] = (due[edge(e.start)] || 0) + 1;
+              add(source, 1);
+            };
+
             for (const source of removeAll ? [] : srcNames) {
               if (source === target) continue;
+              const masters = new Map();   // repeating events, by id
+              const dropped = new Map();   // repeating event id -> original starts of its cancelled occurrences
+              for (const r of itemsOf(srcRawBy[source])) {
+                if (!r || !r.id) continue;
+                if (Array.isArray(r.recurrence) && r.recurrence.length) masters.set(r.id, r);
+                else if (r.recurringEventId && r.status === "cancelled" && r.originalStartTime) {
+                  if (!dropped.has(r.recurringEventId)) dropped.set(r.recurringEventId, []);
+                  dropped.get(r.recurringEventId).push(r.originalStartTime);
+                }
+              }
+
+              const runs = new Map();      // repeating event id -> its occurrences in the window
               for (const e of itemsOf(srcBy[source])) {
-                if (!blocks(e)) continue;
-                const m = meeting(e);
-                // The target already has this meeting itself, or another
-                // source already supplied a block for it.
-                if (m && (held.has(m) || seen.has(m))) continue;
-                if (alreadyBusy(e)) { covered++; continue; }
-                if (m) seen.add(m);
-                const key = source + "/" + e.id;
-                want.set(key, body(key, e));
-                const pair = source + " -> " + target;
-                wanted[pair] = (wanted[pair] || 0) + 1;
+                if (!live(e)) continue;
+                let needs = blocks(e);
+                if (needs) {
+                  const m = meeting(e);
+                  // The target already has this meeting itself, or another
+                  // source already supplied a block for it.
+                  if (m && (held.has(m) || seen.has(m))) needs = false;
+                  else if (alreadyBusy(e)) { covered++; needs = false; }
+                  else if (m) seen.add(m);
+                }
+                const rid = e.recurringEventId;
+                if (rid && e.originalStartTime && repeats(masters.get(rid))) {
+                  if (!runs.has(rid)) runs.set(rid, []);
+                  runs.get(rid).push({ e, needs });
+                } else if (needs) {
+                  one(source, e);
+                }
+              }
+
+              for (const [rid, occ] of runs) {
+                const master = masters.get(rid);
+                // On the rule: where and as long as the rule puts it.
+                const onRule = (e) => edge(e.start) === edge(e.originalStartTime) && len(e) === len(master);
+                const keep = occ.filter((o) => o.needs && onRule(o.e));
+                const skip = occ.filter((o) => !(o.needs && onRule(o.e)));
+                const gone = dropped.get(rid) || [];
+                // One repeating block when most occurrences ahead need it.
+                // Otherwise the few that do get a block each.
+                if (keep.length && keep.length >= skip.length + gone.length) {
+                  keep.sort((x, y) => Date.parse(x.e.start.dateTime || x.e.start.date) - Date.parse(y.e.start.dateTime || y.e.start.date));
+                  const key = source + "/" + rid;
+                  want.set(key, series(key, master, keep[0].e, skip.map((o) => o.e.originalStartTime).concat(gone)));
+                  repeating++;
+                  add(source, keep.length);
+                  for (const o of keep) due[edge(o.e.start)] = (due[edge(o.e.start)] || 0) + 1;
+                  // Moved or resized, yet still busy: a block of its own.
+                  for (const o of skip) if (o.needs) one(source, o.e);
+                } else {
+                  for (const o of occ) if (o.needs) one(source, o.e);
+                }
               }
             }
 
-            // Which blocks ARE on it. A key seen twice is a duplicate (two runs
-            // raced); the first is kept, the rest go.
+            // How far the calendar is from that, counted in occurrences. It is
+            // non-zero before a run writes; a number that stays up afterwards
+            // means a repeating block is not landing where the plan expects.
+            const have = {};
+            for (const e of existing) if (tagOf(e)) have[edge(e.start)] = (have[edge(e.start)] || 0) + 1;
+            for (const k of new Set(Object.keys(due).concat(Object.keys(have)))) {
+              adrift += Math.abs((due[k] || 0) - (have[k] || 0));
+            }
+
+            // Which blocks ARE on it: this pack's events, a repeating block
+            // counted once. A key seen twice is a duplicate (two runs raced);
+            // the first is kept, the rest go.
+            const mine = itemsOf(dstRawBy[target]).filter((e) => live(e) && tagOf(e) && !e.recurringEventId);
             const kept = new Set();
-            for (const e of existing) {
+            for (const e of mine) {
               const key = tagOf(e);
-              if (!key) continue;
               if (!want.has(key) || kept.has(key)) {
                 deletes.push({ target, event_id: e.id });
                 // Its source calendar is still bound, yet the event is gone.
@@ -307,10 +446,13 @@ workflows:
             updates: updates.slice(0, batch),
             deletes: deletes.slice(0, batch),
             pending: left,
-            summary: creates.length + " to create, " + updates.length + " to move, " + deletes.length +
+            adrift,
+            summary: creates.length + " to create, " + updates.length + " to change, " + deletes.length +
               " to remove across " + dstNames.length + " target(s) from " + srcNames.length + " source(s)" +
-              "; blocks wanted: " + (Object.keys(wanted).sort().map((k) => k + " " + wanted[k]).join(", ") || "none") +
+              "; occurrences to block: " + (Object.keys(wanted).sort().map((k) => k + " " + wanted[k]).join(", ") || "none") +
+              (repeating ? "; " + repeating + " repeating block(s)" : "") +
               (covered ? "; " + covered + " already blocked on the target" : "") +
+              (adrift ? "; " + adrift + " occurrence(s) not yet in step" : "") +
               (removeAll ? "; remove_all is on" : "") +
               (left ? "; batch_size " + batch + ", " + left + " left for later runs" : ""),
           };
